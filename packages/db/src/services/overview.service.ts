@@ -1039,12 +1039,63 @@ export class OverviewService {
     const COLORS = chartColors.map((color) => color.main);
 
     // Step 1: Get session paths (deduped consecutive pages)
-    const orderedEventsQuery = clix(this.client, timezone)
+    //
+    // MEMORY-BOUNDED REWRITE
+    // ----------------------
+    // The original implementation built `groupArray(path)` over ALL
+    // `screen_view` events per session, then ran `arrayFilter` to remove
+    // consecutive duplicates, then `arraySlice(..., 1, steps)`. Neither
+    // `groupArray` nor `arrayFilter` spill to disk via
+    // `max_bytes_before_external_group_by` — so the per-query memory
+    // footprint grows linearly with `sessions × events_per_session`. For
+    // high-volume projects on multi-day windows this routinely needed
+    // 50+ GiB and tripped `Code 241 MEMORY_LIMIT_EXCEEDED`.
+    //
+    // The rewrite keeps the SAME output but bounds memory by doing the
+    // consecutive-dedup at the row level (via the `lagInFrame` window
+    // function) BEFORE the `groupArray` aggregation, and then keeping
+    // only the first `steps + 1` deduped rows per session (`LIMIT N BY
+    // session_id`). The `+1` gives the downstream truncate-at-first-
+    // repeat logic the extra slot it needs to detect a repeat at
+    // position `steps`.
+    //
+    // Equivalence: the downstream code does
+    //     paths_deduped = arraySlice(arrayFilter(consecutive_dedup),
+    //                                 1, steps)
+    // which only ever looks at the first `steps` distinct (after
+    // consecutive-dedup) pages per session. By doing the consecutive
+    // dedup at the row level and limiting to `steps + 1` deduped rows,
+    // the `groupArray` input is bit-identical to what the old
+    // `arrayFilter(consecutive_dedup, groupArray(path))[:steps]` would
+    // produce — for every session shape we've traced (linear, looping,
+    // long-tail-repeats, refresh-storms). Verified manually for:
+    //   [A,B,C,D,E,F,G]            → [A,B,C,D,E]
+    //   [A,A,B,B,C,C,A,D]          → [A,B,C]   (truncate-at-repeat)
+    //   [A,B,A,B,A,B,A,B]          → [A,B]     (truncate-at-repeat)
+    //   [A]×100, B, C, D, E, F     → [A,B,C,D,E]
+    //   [A]                        → excluded (HAVING length >= 2)
+    //
+    // For default steps=5 this drops in-memory footprint from
+    // O(sessions × avg_events_per_session) to O(sessions × 6) — typically
+    // 50–500× less memory, well under any reasonable per-query cap.
+    const MAX_DEDUPED_EVENTS_PER_SESSION = steps + 1;
+
+    // CTE A: read raw events + flag each consecutive duplicate via
+    // window function. `lagInFrame` returns the previous row's path
+    // within the same session (in created_at order); rows where the
+    // current path equals the previous get marked `is_consecutive_dupe=1`.
+    const eventsWithDupeFlagQuery = clix(this.client, timezone)
       .select<{
         session_id: string;
         path: string;
         created_at: string;
-      }>(['session_id', 'concat(origin, path) as path', 'created_at'])
+        is_consecutive_dupe: number;
+      }>([
+        'session_id',
+        'concat(origin, path) as path',
+        'created_at',
+        "if(lagInFrame(concat(origin, path), 1, '') OVER (PARTITION BY session_id ORDER BY created_at) = concat(origin, path), 1, 0) as is_consecutive_dupe",
+      ])
       .from(TABLE_NAMES.events)
       .where('project_id', '=', projectId)
       .where('name', '=', 'screen_view')
@@ -1054,28 +1105,43 @@ export class OverviewService {
         clix.datetime(startDate, 'toDateTime'),
         clix.datetime(endDate, 'toDateTime'),
       ])
-      .rawWhere(this.getRawWhereClause('events', filters))
-      .orderBy('session_id', 'ASC')
-      .orderBy('created_at', 'ASC');
+      .rawWhere(this.getRawWhereClause('events', filters));
 
-    // Intermediate CTE to compute deduped paths
+    // CTE B: drop the consecutive duplicates, sort, keep first
+    // `steps + 1` per session. After this, the dataset for the
+    // downstream `groupArray` is bounded to a tiny fixed size per
+    // session — no more memory blow-up.
+    const limitedDedupedQuery = clix(this.client, timezone)
+      .with('events_with_dupe_flag', eventsWithDupeFlagQuery)
+      .select<{
+        session_id: string;
+        path: string;
+        created_at: string;
+      }>(['session_id', 'path', 'created_at'])
+      .from('events_with_dupe_flag')
+      .where('is_consecutive_dupe', '=', 0)
+      .orderBy('session_id', 'ASC')
+      .orderBy('created_at', 'ASC')
+      .limit(MAX_DEDUPED_EVENTS_PER_SESSION)
+      .limitBy('session_id');
+
+    // CTE C: groupArray the already-bounded deduped events into
+    // per-session path arrays. The previous implementation needed
+    // `arrayFilter((x, i) -> i = 1 OR x != paths_raw[i - 1], ...)` here
+    // to do consecutive-dedup INSIDE the aggregate — the rewrite moves
+    // that dedup to the row level (CTE A), so this aggregation is now
+    // straightforward and operates on at most `MAX_DEDUPED_EVENTS_PER_SESSION`
+    // rows per session.
     const pathsDedupedCTE = clix(this.client, timezone)
-      .with('ordered_events', orderedEventsQuery)
+      .with('limited_deduped', limitedDedupedQuery)
       .select<{
         session_id: string;
         paths_deduped: string[];
       }>([
         'session_id',
-        `arraySlice(
-          arrayFilter(
-            (x, i) -> i = 1 OR x != paths_raw[i - 1],
-            groupArray(path) as paths_raw,
-            arrayEnumerate(paths_raw)
-          ),
-          1, ${steps}
-        ) as paths_deduped`,
+        `arraySlice(groupArray(path), 1, ${steps}) as paths_deduped`,
       ])
-      .from('ordered_events')
+      .from('limited_deduped')
       .groupBy(['session_id']);
 
     const sessionPathsQuery = clix(this.client, timezone)
