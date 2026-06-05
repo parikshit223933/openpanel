@@ -55,6 +55,7 @@ export class Query<T = any> {
     direction: 'ASC' | 'DESC';
   }[] = [];
   private _limit?: number;
+  private _limitByColumns?: string[];
   private _offset?: number;
   private _final = false;
   private _settings: Record<string, string> = {};
@@ -245,6 +246,24 @@ export class Query<T = any> {
   limit(limit?: number): this {
     if (limit !== undefined) {
       this._limit = limit;
+    }
+    return this;
+  }
+
+  /**
+   * Cap the LIMIT to be PER-GROUP via ClickHouse's `LIMIT N BY <expr>` syntax.
+   * Useful for queries that read events grouped by an entity (e.g. session_id)
+   * where each entity has unbounded events and the downstream aggregation
+   * (`groupArray`, `arrayFilter`) can't spill to disk — without this cap
+   * one runaway session can blow up per-query memory.
+   *
+   * Emits `LIMIT N BY col1, col2, ...` after `LIMIT N` in the SQL.
+   * No-op unless `limit()` is also set; the LIMIT value itself bounds the
+   * per-group count.
+   */
+  limitBy(...columns: string[]): this {
+    if (columns.length > 0) {
+      this._limitByColumns = columns;
     }
     return this;
   }
@@ -491,6 +510,12 @@ export class Query<T = any> {
     // LIMIT & OFFSET
     if (this._limit !== undefined) {
       parts.push(`LIMIT ${this._limit}`);
+      if (
+        this._limitByColumns !== undefined &&
+        this._limitByColumns.length > 0
+      ) {
+        parts.push(`BY ${this._limitByColumns.join(', ')}`);
+      }
       if (this._offset !== undefined) {
         parts.push(`OFFSET ${this._offset}`);
       }
