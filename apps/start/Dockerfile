@@ -63,6 +63,25 @@ COPY tooling ./tooling
 # Generate Prisma client and build the app
 RUN pnpm --filter start run build
 
+# `@number-flow/react`'s compiled output imports the bare specifier `esm-env`,
+# which this workspace aliases to `esm-env-runtime` via a pnpm override (see
+# `pnpm.overrides` in the root package.json). That alias resolves during the
+# build install, but nitro's traced standalone server bundle
+# (apps/start/.output/server/node_modules) only carries the physical
+# `esm-env-runtime` package, not the `esm-env` name. At runtime
+# `node .output/server/index.mjs` then throws
+# `ERR_MODULE_NOT_FOUND: Cannot find package 'esm-env'` while server-rendering
+# any page that mounts a NumberFlow component (charts, stat cards, live
+# counters), which surfaces to users as a generic "Something went wrong" page.
+# Materialize the alias so the bare specifier resolves. No-op once the bundle
+# preserves it natively (or if NumberFlow / the override is removed upstream).
+RUN set -eux; \
+    out="apps/start/.output/server/node_modules"; \
+    if [ -d "$out/esm-env-runtime" ] && [ ! -e "$out/esm-env" ]; then \
+      cp -r "$out/esm-env-runtime" "$out/esm-env"; \
+      test -f "$out/esm-env/package.json"; \
+    fi
+
 # PROD - Install only production dependencies
 FROM base AS prod
 
